@@ -5,12 +5,22 @@ import base64
 import random
 import string
 import time
+import os
+import subprocess
 from playwright.sync_api import sync_playwright
 
-# --- CONFIGURATION & UI SETUP ---
-st.set_page_config(page_title="Gimkit Lobby Scanner", page_icon="🔍")
+# --- CRITICAL FIX FOR STREAMLIT CLOUD ---
+# This ensures Chromium is actually installed on the server
+@st.cache_resource
+def install_browser():
+    # Only runs once per session deployment
+    subprocess.run(["playwright", "install", "chromium"])
+
+install_browser()
+# ----------------------------------------
+
+st.set_page_config(page_title="Gimkit Scanner", page_icon="🔍")
 st.title("🔍 Gimkit Lobby Scanner")
-st.markdown("Enter a Game Code to check the lobby status and player list.")
 
 game_code = st.text_input("Enter Game Code:", placeholder="115257")
 scan_button = st.button("Scan Lobby")
@@ -25,13 +35,13 @@ def extract_strings(binary_data):
         return []
 
 def scan_lobby(code):
+    # Generates a name like Scanner_X92J to avoid 'taken' errors
     rand_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     bot_name = f"Scanner_{rand_id}"
     seen_players = set()
-    status = "Active"
 
     with sync_playwright() as p:
-        # Headless must be True for cloud hosting
+        # headless=True is mandatory for the web
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
@@ -44,7 +54,6 @@ def scan_lobby(code):
                 opcode = params['response'].get('opcode', 1)
                 raw_bytes = payload.encode('utf-8') if opcode == 1 else base64.b64decode(payload)
                 words = extract_strings(raw_bytes)
-
                 for i in range(1, len(words)):
                     if words[i].strip() == "player":
                         name = words[i-1].replace('"', '').strip()
@@ -56,50 +65,51 @@ def scan_lobby(code):
         client.on("Network.webSocketFrameReceived", on_frame)
         
         try:
-            page.goto(f"https://www.gimkit.com/join?gc={code}", timeout=10000)
-            time.sleep(1.5)
+            page.goto(f"https://www.gimkit.com/join?gc={code}", timeout=15000)
+            time.sleep(1)
             
             if page.get_by_text("Game not found").is_visible():
                 return "Closed", [], 0
             
-            # Attempt to join to trigger the socket
+            # Type and Enter
             page.keyboard.press("Tab")
             page.keyboard.type(bot_name)
             page.keyboard.press("Enter")
             
-            # Watchdog loop (max 10 seconds)
+            # Watchdog: Wait for first name, then 0.3s burst
             start_time = time.time()
-            while time.time() - start_time < 10:
+            while time.time() - start_time < 8: # 8s max wait
                 if len(seen_players) > 0:
-                    time.sleep(0.3) # User-requested 0.3s burst
+                    time.sleep(0.3) 
                     break
-                time.sleep(0.2)
+                time.sleep(0.1)
                 
-        except Exception as e:
+        except Exception:
             return "Error", [], 0
         finally:
             browser.close()
 
+    # Filter out our unique bot name
     final_list = [p for p in seen_players if p != bot_name]
     return "Active", final_list, len(final_list)
 
-# --- EXECUTION ---
 if scan_button and game_code:
-    with st.spinner(f"Joining {game_code}..."):
+    with st.spinner("🕵️ Stepping into the lobby..."):
         status, players, count = scan_lobby(game_code)
         
     if status == "Closed":
-        st.error("❌ Game Not Active (Game not found)")
+        st.error("❌ Room Closed (Game not found)")
     elif status == "Error":
-        st.warning("⚠️ Connection Error. Try again.")
+        st.warning("⚠️ Connection timed out. The room might be dead.")
     else:
-        st.success("✅ Lobby Captured!")
-        col1, col2 = st.columns(2)
-        col1.metric("Room Status", "OPEN")
-        col2.metric("Player Count", count)
+        st.balloons()
+        st.success(f"✅ Found {count} players!")
+        
+        st.metric(label="Room Status", value="OPEN")
         
         if players:
-            st.write("### 📜 Usernames")
+            st.subheader("📜 Player List")
+            # Displays as a clean, searchable list
             st.write(", ".join(players))
         else:
-            st.info("The room is empty (except for the bot).")
+            st.info("The lobby is currently empty.")
